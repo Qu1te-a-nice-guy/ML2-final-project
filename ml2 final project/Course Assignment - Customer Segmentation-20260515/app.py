@@ -9,6 +9,9 @@ import segmentation
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Customer Segmentation", layout="wide")
 
+# ── Reset chart style to default white ────────────────────────────────────────
+plt.style.use("default")
+
 # ── Load data ─────────────────────────────────────────────────────────────────
 @st.cache_data
 def load_data():
@@ -22,7 +25,7 @@ def load_data():
     with open("feature_cols.json") as f:
         feature_cols = json.load(f)
 
-    pca_data, _ = run_pca(customer_info_scaled[feature_cols])
+    pca_data, pca_model = run_pca(customer_info_scaled[feature_cols])
     final_df    = apply_final_clustering(pca_data, customer_info_processed, k=5)
 
     cluster_names = {
@@ -53,9 +56,9 @@ def load_data():
             basket_df, customer_clusters, cid, top_n=10
         )
 
-    return final_df, cluster_profiles, cluster_rules, top_products, cluster_names, basket_df
+    return final_df, cluster_profiles, cluster_rules, top_products, cluster_names, basket_df, pca_data, pca_model, feature_cols
 
-final_df, cluster_profiles, cluster_rules, top_products, cluster_names, basket_df = load_data()
+final_df, cluster_profiles, cluster_rules, top_products, cluster_names, basket_df, pca_data, pca_model, feature_cols = load_data()
 
 COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3"]
 
@@ -92,7 +95,6 @@ if section == "Overview":
         with cols[i]:
             st.metric(label=name, value=f"{count:,}", delta=f"Avg €{avg_spend:,.0f}")
 
-    st.divider()
 
     # Pie chart + bar chart side by side
     col1, col2 = st.columns(2)
@@ -118,6 +120,69 @@ if section == "Overview":
         plt.tight_layout()
         st.pyplot(fig)
 
+    # PCA Scatter Plot
+    st.subheader("Customer Clusters — PCA Projection")
+    st.markdown("Each dot represents a customer, projected onto the first two principal components.")
+
+    # Cluster selector
+    pca_selected = st.multiselect(
+        "Select clusters to display",
+        options=list(cluster_names.values()),
+        default=list(cluster_names.values()),
+        key="pca_cluster_select"
+    )
+
+    # Compute axis labels with explained variance
+    pc1_var = pca_model.explained_variance_ratio_[0] * 100
+    pc2_var = pca_model.explained_variance_ratio_[1] * 100
+
+    # Find top 3 contributing features per component
+    clean = lambda s: s.replace("lifetime_spend_", "").replace("lifetime_total_", "").replace("_", " ").title()
+    top3_pc1 = [feature_cols[i] for i in np.argsort(np.abs(pca_model.components_[0]))[::-1][:3]]
+    top3_pc2 = [feature_cols[i] for i in np.argsort(np.abs(pca_model.components_[1]))[::-1][:3]]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for cid, name in cluster_names.items():
+        if name not in pca_selected:
+            continue
+        mask = final_df["cluster"] == cid
+        ax.scatter(
+            pca_data[mask.values, 0],
+            pca_data[mask.values, 1],
+            c=COLORS[cid], label=name, alpha=0.4, s=10, edgecolors="none"
+        )
+    ax.set_xlabel(f"PC 1  ({pc1_var:.1f}% variance explained)", fontsize=12)
+    ax.set_ylabel(f"PC 2  ({pc2_var:.1f}% variance explained)", fontsize=12)
+    ax.legend(markerscale=3, framealpha=0.9)
+    ax.grid(alpha=0.2)
+    plt.tight_layout()
+    st.pyplot(fig)
+
+    # Show what the principal components represent
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.info(f"**PC 1** top features: {', '.join(clean(f) for f in top3_pc1)}")
+    with col_b:
+        st.info(f"**PC 2** top features: {', '.join(clean(f) for f in top3_pc2)}")
+
+    # Demographics comparison chart
+    st.subheader("Demographics Comparison Across Clusters")
+
+    demo_cols = ["age", "kids_home", "teens_home"]
+    demo_labels = ["Avg Age", "Kids at Home", "Teens at Home"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    for idx, (col, label) in enumerate(zip(demo_cols, demo_labels)):
+        vals = [cluster_profiles.loc[c, col] for c in range(5)]
+        names = [cluster_names[c] for c in range(5)]
+        bars = axes[idx].bar(names, vals, color=COLORS)
+        axes[idx].set_title(label, fontsize=12, fontweight="bold")
+        axes[idx].bar_label(bars, fmt="%.1f", padding=3, fontsize=8)
+        axes[idx].set_xticklabels(names, rotation=35, ha="right", fontsize=8)
+        axes[idx].grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    st.pyplot(fig)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. CLUSTER EXPLORER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -128,7 +193,6 @@ elif section == "Cluster Explorer":
     cid = [k for k, v in cluster_names.items() if v == selected_name][0]
 
     # Persona card
-    st.divider()
     col1, col2 = st.columns([1, 2])
     with col1:
         st.markdown(f"### {selected_name}")
@@ -150,9 +214,8 @@ elif section == "Cluster Explorer":
         tp.columns = ["Product", "Count"]
         st.dataframe(tp, hide_index=True, use_container_width=True)
 
-    st.divider()
 
-    # Spend breakdown bar chart
+
     st.subheader("Spend Breakdown")
     spend_cols = [
         "lifetime_spend_groceries", "lifetime_spend_electronics",
@@ -262,7 +325,6 @@ elif section == "Promotion Simulator":
     avg_spend_cat = cluster_profiles.loc[cid, cat_col]
     estimated_saving = avg_spend_cat * (discount / 100) * n_affected
 
-    st.divider()
     col1, col2, col3 = st.columns(3)
     col1.metric("Cluster size", f"{len(cluster_df):,} customers")
     col2.metric("Customers with spend in category", f"{n_affected:,}")
@@ -271,7 +333,6 @@ elif section == "Promotion Simulator":
     else:
         col3.metric("Customers reached", f"{n_affected:,}")
 
-    st.divider()
     st.subheader("Suggested promotion")
     rules = cluster_rules[cid]
     if not rules.empty:
@@ -306,7 +367,6 @@ elif section == "Product Search":
         product = st.selectbox("Select a product", all_products)
 
     if product:
-        st.divider()
         st.subheader(f"Results for: *{product}*")
 
         # Which cluster buys it most
